@@ -29,7 +29,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 PROFILE_DIR = r"C:\SeleniumChromeProfile"
-TARGET_URL = "https://app.caffiliate.vn/rewards"
 
 CHECKIN_BUTTON_ID = "btnCheckIn"
 CHECKIN_XPATH = "//a[contains(text(), 'NHẬN QUÀ')] | //button[contains(text(), 'NHẬN QUÀ')]"
@@ -41,14 +40,18 @@ JS_POLL_INTERVAL_MS = 10
 
 API_HOST = "app.caffiliate.vn"
 API_PATH = "/api/v2/xeng/check-in-secure"
+TARGET_URL = f"https://{API_HOST}/rewards"
 CHECKIN_API_URL = f"https://{API_HOST}{API_PATH}"
+STATUS_API_URL = f"https://{API_HOST}/api/v2/xeng/check-in/status"
 XENG_SECRET_FALLBACK = "caffi_xeng_secure_2026_x82"
 
-# Fire trước midnight ~500ms: đêm Top 3 fire 23:59:59.526 với latency 493ms thành công.
-# Server queue và xử lý request quanh midnight, mình vào queue sớm.
-API_FIRE_OFFSET_MS = -500
-API_BURST_COUNT = 4
-API_BURST_SPACING_MS = 100
+# Parallel burst: spawn N thread cùng lúc, mỗi thread tự delay theo offset riêng.
+# Spacing 20ms × 10 thread = trải dài 180ms từ -200 tới -20ms client time.
+# Server nhận tương ứng quanh midnight ± 80ms (latency 99ms one-way).
+API_FIRE_OFFSET_MS = -200
+API_BURST_COUNT = 12
+API_BURST_SPACING_MS = 17
+
 
 def _load_dotenv():
     """Load key=value pairs từ .env vào os.environ (chỉ set nếu chưa có)."""
@@ -205,9 +208,7 @@ def now_mode():
 
         # Click an toàn: chờ thực sự clickable trong 3s, nếu không thì coi như disabled
         try:
-            button = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((By.ID, CHECKIN_BUTTON_ID))
-            )
+            button = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.ID, CHECKIN_BUTTON_ID)))
         except Exception:
             msg = "⚠️ Nút không clickable (state chuyển sang disabled) — đã điểm danh hôm nay."
             print(msg)
@@ -283,6 +284,25 @@ def build_headers(creds):
     }
 
 
+def get_checkin_status(creds):
+    """GET /api/v2/xeng/check-in/status — trả về dict data hoặc None nếu fail."""
+    headers = {
+        "Accept": "*/*",
+        "Cookie": creds["cookies"],
+        "User-Agent": creds["user_agent"],
+        "Referer": "https://app.caffiliate.vn/rewards",
+    }
+    req = urllib.request.Request(STATUS_API_URL, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read())
+        if payload.get("success"):
+            return payload.get("data")
+    except Exception as e:
+        print(f"get_checkin_status fail: {e}")
+    return None
+
+
 def post_checkin(creds):
     headers = build_headers(creds)
     req = urllib.request.Request(CHECKIN_API_URL, data=b"{}", headers=headers, method="POST")
@@ -347,6 +367,7 @@ def api_mode():
         _api_mode_inner()
     except Exception as e:
         import traceback
+
         tb = traceback.format_exc()[-800:]
         send_telegram(f"💥 api_mode CRASH: {type(e).__name__}: {str(e)[:200]}\n{tb}")
         raise
@@ -364,9 +385,7 @@ def _api_mode_inner():
         send_telegram(f"Bắt đầu phiên API điểm danh ngày {datetime.now().strftime('%Y-%m-%d')}")
 
         try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.ID, CHECKIN_BUTTON_ID))
-            )
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, CHECKIN_BUTTON_ID)))
         except Exception as e:
             send_telegram(f"🚨 Page không load button: {type(e).__name__}. logged_out={is_logged_out(driver)}")
             return
@@ -380,47 +399,80 @@ def _api_mode_inner():
     if not creds:
         return
 
-    # Chờ tới fire time
+    # QUAN TRỌNG: không gửi telegram giữa wait và burst — telegram API có thể chậm
+    # 500-1000ms ở midnight, đẩy lùi fire time. Gửi heartbeat TRƯỚC wait.
+    send_telegram(f"🎯 Sẽ fire burst {API_BURST_COUNT} request lúc midnight{API_FIRE_OFFSET_MS:+d}ms")
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Wait until midnight{API_FIRE_OFFSET_MS:+d}ms...", flush=True)
-    wait_until_next_midnight(offset_ms=API_FIRE_OFFSET_MS)
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Start burst", flush=True)
-    send_telegram(f"🎯 Bắt đầu burst {API_BURST_COUNT} request lúc {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
 
-    # Burst N requests qua urllib (mỗi request tự tạo connection, không tái dùng).
-    # Timeout 3s mỗi request để tránh hang vô hạn nếu server không trả lời.
-    results = []
+    # Pre-resolve DNS để bypass DNS lookup lúc fire (urllib cache DNS theo connection)
+    try:
+        import socket as _socket
+
+        _socket.getaddrinfo(API_HOST, 443)
+    except Exception:
+        pass
+
+    wait_until_next_midnight(offset_ms=API_FIRE_OFFSET_MS)
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Fire {API_BURST_COUNT} parallel threads", flush=True)
+
+    # Burst PARALLEL: spawn N thread, mỗi thread tự delay theo i × spacing rồi fire.
+    # Tất cả thread đã start cùng lúc nên spacing thực tế chính xác (không bị block bởi response).
+    import threading
+
+    _socket.setdefaulttimeout(3)
+    results = [None] * API_BURST_COUNT
+    threads = []
+
+    def fire_at(idx):
+        time.sleep(idx * API_BURST_SPACING_MS / 1000.0)
+        sent_at, payload = post_checkin(creds)
+        recv_at = datetime.now()
+        latency_ms = (recv_at - sent_at).total_seconds() * 1000
+        results[idx] = (idx, sent_at, payload, latency_ms, recv_at)
+        print(f"[{recv_at.strftime('%H:%M:%S.%f')[:-3]}] #{idx + 1} done ({latency_ms:.0f}ms): {str(payload)[:80]}", flush=True)
+
+    for i in range(API_BURST_COUNT):
+        t = threading.Thread(target=fire_at, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Chờ tất cả thread xong (timeout 10s tổng)
+    deadline = time.time() + 10
+    for t in threads:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
+    # Lọc kết quả, tìm success sớm nhất (theo sent_at)
+    successes = [r for r in results if r and r[2].get("success")]
     success_payload = None
     success_idx = -1
     success_sent_at = None
     success_recv_at = None
-    import socket as _socket
-    _socket.setdefaulttimeout(3)
-    for i in range(API_BURST_COUNT):
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] burst #{i+1}", flush=True)
-        sent_at, payload = post_checkin(creds)
-        recv_at = datetime.now()
-        latency_ms = (recv_at - sent_at).total_seconds() * 1000
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] burst #{i+1} done ({latency_ms:.0f}ms): {str(payload)[:120]}", flush=True)
-        results.append((i, sent_at, payload, latency_ms))
-        if payload.get("success") and success_payload is None:
-            success_payload = payload
-            success_idx = i
-            success_sent_at = sent_at
-            success_recv_at = recv_at
-            break
-        if i < API_BURST_COUNT - 1:
-            time.sleep(API_BURST_SPACING_MS / 1000.0)
+    if successes:
+        successes.sort(key=lambda r: r[1])  # sort by sent_at
+        success_idx, success_sent_at, success_payload, _, success_recv_at = successes[0]
 
     if success_payload and success_sent_at and success_recv_at:
         data = success_payload.get("data", {})
         latency_ms = (success_recv_at - success_sent_at).total_seconds() * 1000
-        fire = success_sent_at.strftime('%H:%M:%S.%f')[:-3]
-        msg = f"✅ streak={data.get('streakDay')} +{data.get('rewardValue')} | #{success_idx + 1} | fire {fire} | {latency_ms:.0f}ms"
+        fire = success_sent_at.strftime("%H:%M:%S.%f")[:-3]
+        # Query status để lấy ranking thực tế
+        status = get_checkin_status(creds)
+        position = status.get("todayCheckInPosition") if status else None
+        pos_str = f" | 🏆 top {position}" if position else ""
+        msg = f"✅ streak={data.get('streakDay')} +{data.get('rewardValue')}{pos_str} | burst #{success_idx + 1} | fire {fire} | {latency_ms:.0f}ms"
         print(msg)
         send_telegram(msg)
     else:
-        first_err = results[0][2].get('message') or results[0][2].get('error') or 'fail'
-        msg = f"❌ Burst x{API_BURST_COUNT} fail: {first_err}"
+        completed = [r for r in results if r]
+        if completed:
+            p = completed[0][2]
+            first_err = p.get("message") or p.get("error") or "fail"
+        else:
+            first_err = "no thread completed (timeout?)"
+        msg = f"❌ Burst x{API_BURST_COUNT} fail ({len(completed)}/{API_BURST_COUNT} done): {first_err}"
         print(msg)
         send_telegram(msg)
 
@@ -503,7 +555,7 @@ def checkin_mode():
 
         # Chờ qua midnight rồi REFRESH page để server gửi state ngày mới (button enable cho hôm sau)
         wait_until(MIDNIGHT_REFRESH_AT)
-        refresh_ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        refresh_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         try:
             driver.refresh()
         except WebDriverException as e:
