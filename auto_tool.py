@@ -33,7 +33,7 @@ PROFILE_DIR = r"C:\SeleniumChromeProfile"
 CHECKIN_BUTTON_ID = "btnCheckIn"
 CHECKIN_XPATH = "//a[contains(text(), 'NHẬN QUÀ')] | //button[contains(text(), 'NHẬN QUÀ')]"
 
-PRELOAD_AT = (23, 59, 50)
+PRELOAD_AT = (23, 59, 30)  # 30s buffer cho extract + telegrams trước midnight
 MIDNIGHT_REFRESH_AT = (0, 0, 0)
 RESULT_WAIT_SECONDS = 60
 JS_POLL_INTERVAL_MS = 10
@@ -48,9 +48,9 @@ XENG_SECRET_FALLBACK = "caffi_xeng_secure_2026_x82"
 # Parallel burst: spawn N thread cùng lúc, mỗi thread tự delay theo offset riêng.
 # Spacing 20ms × 10 thread = trải dài 180ms từ -200 tới -20ms client time.
 # Server nhận tương ứng quanh midnight ± 80ms (latency 99ms one-way).
-API_FIRE_OFFSET_MS = -200
+API_FIRE_OFFSET_MS = -350
 API_BURST_COUNT = 12
-API_BURST_SPACING_MS = 17
+API_BURST_SPACING_MS = 25
 
 
 def _load_dotenv():
@@ -284,6 +284,19 @@ def build_headers(creds):
     }
 
 
+def measure_latency(creds):
+    """Đo RTT tới API host bằng GET status. Trả về ms hoặc None nếu fail."""
+    headers = {"Cookie": creds["cookies"], "User-Agent": creds["user_agent"], "Accept": "*/*"}
+    req = urllib.request.Request(STATUS_API_URL, headers=headers, method="GET")
+    start = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+    except Exception:
+        return None
+    return (time.time() - start) * 1000
+
+
 def get_checkin_status(creds):
     """GET /api/v2/xeng/check-in/status — trả về dict data hoặc None nếu fail."""
     headers = {
@@ -399,12 +412,16 @@ def _api_mode_inner():
     if not creds:
         return
 
-    # QUAN TRỌNG: không gửi telegram giữa wait và burst — telegram API có thể chậm
-    # 500-1000ms ở midnight, đẩy lùi fire time. Gửi heartbeat TRƯỚC wait.
-    send_telegram(f"🎯 Sẽ fire burst {API_BURST_COUNT} request lúc midnight{API_FIRE_OFFSET_MS:+d}ms")
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Wait until midnight{API_FIRE_OFFSET_MS:+d}ms...", flush=True)
+    # Safety: nếu đã quá midnight (hoặc gần midnight tới mức không đủ thời gian),
+    # abort thay vì chờ midnight ngày kế tiếp (24h)
+    now = datetime.now()
+    if now.hour >= 0 and now.hour < 23:
+        msg = f"🚨 Đã quá midnight ({now.strftime('%H:%M:%S')}). Bỏ qua burst để tránh chờ 24h. Chạy `python auto_tool.py api-now` để cứu vớt."
+        print(msg)
+        send_telegram(msg)
+        return
 
-    # Pre-resolve DNS để bypass DNS lookup lúc fire (urllib cache DNS theo connection)
+    # Pre-resolve DNS để bypass DNS lookup lúc fire
     try:
         import socket as _socket
 
@@ -412,7 +429,30 @@ def _api_mode_inner():
     except Exception:
         pass
 
-    wait_until_next_midnight(offset_ms=API_FIRE_OFFSET_MS)
+    # ĐO LATENCY thực tế ~5s trước midnight bằng 3 mẫu, lấy MAX để safe
+    wait_until_next_midnight(offset_ms=-5000)
+    samples = []
+    for _ in range(3):
+        ms = measure_latency(creds)
+        if ms is not None:
+            samples.append(ms)
+        time.sleep(0.5)
+
+    if samples:
+        max_rtt = max(samples)
+        # Aim burst #1 server arrival sớm hơn để rank cao.
+        # Server processing delay biến động (243ms June 1 → 846ms tối nay).
+        # Để chắc top 3 với processing 1s, server arrival cần ~-300ms trước midnight.
+        # Scale 4x: cover latency tăng vọt + offset thêm 300ms server-side buffer.
+        dynamic_offset_ms = -300 - int(max_rtt * 4 / 2)
+        dynamic_offset_ms = max(-1500, min(-50, dynamic_offset_ms))
+        send_telegram(f"📡 RTT samples {[int(s) for s in samples]}ms, max={int(max_rtt)}ms → fire offset {dynamic_offset_ms}ms")
+    else:
+        dynamic_offset_ms = API_FIRE_OFFSET_MS
+        send_telegram(f"⚠️ RTT đo fail, dùng offset mặc định {dynamic_offset_ms}ms")
+
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Wait until midnight{dynamic_offset_ms:+d}ms...", flush=True)
+    wait_until_next_midnight(offset_ms=dynamic_offset_ms)
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Fire {API_BURST_COUNT} parallel threads", flush=True)
 
     # Burst PARALLEL: spawn N thread, mỗi thread tự delay theo i × spacing rồi fire.
