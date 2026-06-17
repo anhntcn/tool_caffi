@@ -440,11 +440,11 @@ def _api_mode_inner():
 
     if samples:
         max_rtt = max(samples)
-        # Aim burst #1 server arrival sớm hơn để rank cao.
-        # Server processing delay biến động (243ms June 1 → 846ms tối nay).
-        # Để chắc top 3 với processing 1s, server arrival cần ~-300ms trước midnight.
-        # Scale 4x: cover latency tăng vọt + offset thêm 300ms server-side buffer.
-        dynamic_offset_ms = -300 - int(max_rtt * 4 / 2)
+        # Data 4 đêm: server arrival ≤ -460ms = top 3, -240ms = top 4.
+        # Mục tiêu: GUARANTEE server arrival ≤ -460ms ngay cả khi latency spike 5x.
+        # Latency thực lúc fire có thể gấp 5.2x latency đo trước midnight 5s.
+        # fire_offset = target_arrival - estimated_one_way = -460 - max_rtt × 2.5
+        dynamic_offset_ms = -460 - int(max_rtt * 2.5)
         dynamic_offset_ms = max(-1500, min(-50, dynamic_offset_ms))
         send_telegram(f"📡 RTT samples {[int(s) for s in samples]}ms, max={int(max_rtt)}ms → fire offset {dynamic_offset_ms}ms")
     else:
